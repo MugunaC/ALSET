@@ -58,6 +58,7 @@ class DeviceClient:
         self.url = os.environ.get("DEVICE_WS", DEVICE_WS)
         self.backoff = 1
         self.running = False
+        self.last_control_ts = None
 
     async def send_device_hello(self, ws):
         ts, nonce, sig = make_sig(VEHICLE_ID, DEVICE_ID)
@@ -78,6 +79,7 @@ class DeviceClient:
 
     async def handle_control(self, payload):
         # map IVY control payload to robot
+        self.last_control_ts = int(time.time() * 1000)
         axes = payload.get("payload", {}).get("payload", payload.get("payload")) if isinstance(payload.get("payload"), dict) else payload.get("payload", {})
         # robust extraction for either nested or flat payload
         if isinstance(axes, dict):
@@ -94,6 +96,7 @@ class DeviceClient:
         steer = 0.0
         if len(axis_vals) > AXES["LEFT_X"]:
             steer = float(axis_vals[AXES["LEFT_X"]])
+        # send steering via robot API (which may perform safe_send internally)
         self.robot.set_steering(steer)
 
         # throttle and brake from triggers (R2 index 7, L2 index 6)
@@ -158,6 +161,30 @@ class DeviceClient:
                         t = data.get("type")
                         if t == "control":
                             await self.handle_control(data)
+                        elif t == "mission":
+                            # mission message handling: load, persist, and start mission
+                            try:
+                                payload = data.get("payload") or data
+                                if not hasattr(self.robot, "mission_executor"):
+                                    from device.mission_executor import MissionExecutor
+                                    self.robot.mission_executor = MissionExecutor(self.robot)
+                                self.robot.mission_executor.load_mission(payload)
+                                # do not automatically start if mission indicates autostart==false; default start
+                                autostart = payload.get('autostart', True)
+                                if autostart:
+                                    self.robot.mission_executor.start_mission()
+                                # ack back to server
+                                await ws.send(json.dumps({"type": "mission_ack", "status": "accepted", "missionId": payload.get("id", None)}))
+                                if self.robot.debug:
+                                    print("Mission accepted:", payload.get("id"))
+                            except Exception as e:
+                                try:
+                                    await ws.send(json.dumps({"type": "mission_ack", "status": "error", "error": str(e)}))
+                                except Exception:
+                                    pass
+                                if self.robot.debug:
+                                    import traceback
+                                    print("Mission handling error:", traceback.format_exc())
                         elif t == "ping":
                             await ws.send(json.dumps({"type": "pong", "ts": int(time.time() * 1000)}))
                         elif t == "auth_ok":
